@@ -1,5 +1,6 @@
 local uv = vim.loop
-local json = vim.json
+local mpack = vim.mpack
+local bit = bit or require("bit")
 local config = require("acp.init").config
 
 local Client = {}
@@ -7,6 +8,28 @@ Client.__index = Client
 
 local function schedule(fn)
   return vim.schedule_wrap(fn)
+end
+
+local function pack_u32be(n)
+  local b1 = bit.band(bit.rshift(n, 24), 0xFF)
+  local b2 = bit.band(bit.rshift(n, 16), 0xFF)
+  local b3 = bit.band(bit.rshift(n, 8), 0xFF)
+  local b4 = bit.band(n, 0xFF)
+  return string.char(b1, b2, b3, b4)
+end
+
+local function unpack_u32be(bytes)
+  local b1, b2, b3, b4 = bytes:byte(1, 4)
+  local value = bit.bor(
+    bit.lshift(b1, 24),
+    bit.lshift(b2, 16),
+    bit.lshift(b3, 8),
+    b4
+  )
+  if value < 0 then
+    value = value + 4294967296
+  end
+  return value
 end
 
 local function start_timer(timeout, on_timeout)
@@ -74,7 +97,7 @@ function Client:ensure_started()
   local cmd = cfg.bridge_cmd
   self.proc = vim.system(cmd, {
     stdin = true,
-    text = true,
+    text = false,
     stdout = function(_, data)
       if data then
         self:_handle_stdout(data)
@@ -82,7 +105,8 @@ function Client:ensure_started()
     end,
     stderr = function(_, data)
       if data then
-        vim.notify_once("acp bridge: " .. data, vim.log.levels.WARN)
+        local message = type(data) == "string" and data or vim.inspect(data)
+        vim.notify_once("acp bridge: " .. message, vim.log.levels.WARN)
       end
     end,
     env = env,
@@ -96,19 +120,23 @@ function Client:ensure_started()
 end
 
 function Client:_handle_stdout(chunk)
+  if not chunk or chunk == "" then
+    return
+  end
   self.buffer = self.buffer .. chunk
   while true do
-    local nl = self.buffer:find("\n", 1, true)
-    if not nl then
+    if #self.buffer < 4 then
       break
     end
-    local line = self.buffer:sub(1, nl - 1)
-    self.buffer = self.buffer:sub(nl + 1)
-    if line ~= "" then
-      local ok, message = pcall(json.decode, line)
-      if ok then
-        self:_handle_message(message)
-      end
+    local length = unpack_u32be(self.buffer:sub(1, 4))
+    if #self.buffer < (4 + length) then
+      break
+    end
+    local payload = self.buffer:sub(5, 4 + length)
+    self.buffer = self.buffer:sub(5 + length)
+    local ok, message = pcall(mpack.decode, payload)
+    if ok then
+      self:_handle_message(message)
     end
   end
 end
@@ -158,8 +186,9 @@ function Client:_write(obj)
   if not self.stdin then
     error("bridge process unavailable")
   end
-  local encoded = json.encode(obj) .. "\n"
-  self.stdin:write(encoded)
+  local encoded = mpack.encode(obj)
+  local frame = pack_u32be(#encoded) .. encoded
+  self.stdin:write(frame)
 end
 
 function Client:request(method, params, callback, opts)
@@ -190,7 +219,7 @@ function Client:connect(url, cb)
 end
 
 function Client:submit(request, cb)
-    self:request("submit", { request = request }, function(err, result)
+  self:request("submit", { request = request }, function(err, result)
     if not err and result and result.job and result.job.id then
       self.last_job = result.job.id
     end

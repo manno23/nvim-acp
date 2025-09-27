@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import process from "node:process";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
+import { encode, decode } from "@msgpack/msgpack";
 import { startMockServer } from "../../mock/src/mock-server.js";
 async function waitFor(predicate, timeoutMs = 5000) {
     const start = Date.now();
@@ -26,37 +27,40 @@ test("bridge submit flow", async (t) => {
     t.after(() => {
         child.kill();
     });
-    let buffer = "";
+    let buffer = Buffer.alloc(0);
     const responses = new Map();
     const events = [];
-    child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
-        buffer += chunk;
-        let index = buffer.indexOf("\n");
-        while (index !== -1) {
-            const line = buffer.slice(0, index);
-            buffer = buffer.slice(index + 1);
-            if (!line.trim()) {
-                index = buffer.indexOf("\n");
-                continue;
+        buffer = Buffer.concat([buffer, chunk]);
+        while (buffer.byteLength >= 4) {
+            const length = buffer.readUInt32BE(0);
+            if (buffer.byteLength < 4 + length) {
+                break;
             }
-            const message = JSON.parse(line);
+            const frame = buffer.subarray(4, 4 + length);
+            buffer = buffer.subarray(4 + length);
+            const message = decode(frame);
             if (typeof message.id === "number") {
                 responses.set(message.id, message);
             }
             else {
                 events.push(message);
             }
-            index = buffer.indexOf("\n");
         }
     });
-    child.stdin.write(`${JSON.stringify({ id: 1, method: "connect", params: {} })}\n`);
+    function writeMessage(obj) {
+        const payload = Buffer.from(encode(obj));
+        const prefix = Buffer.allocUnsafe(4);
+        prefix.writeUInt32BE(payload.byteLength, 0);
+        child.stdin.write(Buffer.concat([prefix, payload]));
+    }
+    writeMessage({ id: 1, method: "connect", params: {} });
     await waitFor(() => responses.has(1));
-    child.stdin.write(`${JSON.stringify({
+    writeMessage({
         id: 2,
         method: "submit",
         params: { request: { action: "contact_points", parameters: {} } },
-    })}\n`);
+    });
     await waitFor(() => responses.has(2));
     await waitFor(() => events.some((e) => e.method === "event" && e.params.result));
     const resultEvent = events.find((e) => e.method === "event" && e.params.result);

@@ -11,6 +11,7 @@
     "test": "pnpm test:ts"
   },
   "dependencies": {
+    "@msgpack/msgpack": "^3.0.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {

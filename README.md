@@ -5,6 +5,7 @@ Thin Neovim ↔︎ ACP bridge combining a Lua client with a Cap'n Web TypeScript
 ## Features
 
 - Non-blocking communication with ACP via a Node.js sidecar that speaks Cap'n Web over WebSockets.
+- MessagePack-framed stdio RPC between Neovim and the sidecar keeps request/response ordering tight while respecting libuv backpressure.
 - Streamed action events into quickfix, diagnostics, and optional Telescope picker.
 - Commands for common ACP actions and fact subscriptions with cancelation support.
 - Mock ACP server and end-to-end tests for the bridge and Neovim integration.

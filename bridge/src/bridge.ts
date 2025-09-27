@@ -1,6 +1,7 @@
 import process from "node:process";
 import WebSocket from "ws";
 import type { RawData } from "ws";
+import { encode as msgpackEncode, decode as msgpackDecode } from "@msgpack/msgpack";
 import {
   ActionRequest,
   ActionResult,
@@ -20,7 +21,7 @@ interface PendingCall {
 }
 
 class StdoutWriter {
-  private queue: string[] = [];
+  private queue: Buffer[] = [];
   private paused = false;
   private readonly highWaterMark = 200;
 
@@ -32,18 +33,21 @@ class StdoutWriter {
   }
 
   write(obj: unknown) {
-    const payload = `${JSON.stringify(obj)}\n`;
+    const payload = Buffer.from(msgpackEncode(obj));
+    const prefix = Buffer.allocUnsafe(4);
+    prefix.writeUInt32BE(payload.byteLength, 0);
+    const frame = Buffer.concat([prefix, payload]);
     if (this.paused) {
-      this.enqueue(payload);
+      this.enqueue(frame);
       return;
     }
 
-    if (!process.stdout.write(payload)) {
+    if (!process.stdout.write(frame)) {
       this.paused = true;
     }
   }
 
-  private enqueue(payload: string) {
+  private enqueue(payload: Buffer) {
     if (this.queue.length >= this.highWaterMark) {
       this.queue.shift();
       process.stderr.write("[acp-bridge] dropping stdout message due to backpressure\n");
@@ -291,17 +295,14 @@ async function handleRequest(request: BridgeRequest) {
   }
 }
 
-let residual = "";
+let stdinBuffer = Buffer.alloc(0);
 
-function processLine(line: string) {
-  if (!line.trim()) {
-    return;
-  }
+function processFrame(buffer: Uint8Array) {
   let request: BridgeRequest;
   try {
-    request = JSON.parse(line) as BridgeRequest;
+    request = msgpackDecode(buffer) as BridgeRequest;
   } catch (error) {
-    writer.write({ id: -1, error: { message: `Invalid JSON: ${String(error)}` } });
+    writer.write({ id: -1, error: { message: `Invalid msgpack: ${String(error)}` } });
     return;
   }
   handleRequest(request)
@@ -318,15 +319,16 @@ function processLine(line: string) {
     });
 }
 
-process.stdin.setEncoding("utf8");
-process.stdin.on("data", (chunk) => {
-  residual += chunk;
-  let index = residual.indexOf("\n");
-  while (index !== -1) {
-    const line = residual.slice(0, index);
-    residual = residual.slice(index + 1);
-    processLine(line);
-    index = residual.indexOf("\n");
+process.stdin.on("data", (chunk: Buffer) => {
+  stdinBuffer = Buffer.concat([stdinBuffer, chunk]);
+  while (stdinBuffer.byteLength >= 4) {
+    const frameLength = stdinBuffer.readUInt32BE(0);
+    if (stdinBuffer.byteLength < frameLength + 4) {
+      break;
+    }
+    const frame = stdinBuffer.subarray(4, 4 + frameLength);
+    processFrame(frame);
+    stdinBuffer = stdinBuffer.subarray(4 + frameLength);
   }
 });
 

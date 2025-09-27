@@ -1,5 +1,6 @@
 import process from "node:process";
 import WebSocket from "ws";
+import { encode as msgpackEncode, decode as msgpackDecode } from "@msgpack/msgpack";
 class StdoutWriter {
     queue = [];
     paused = false;
@@ -11,12 +12,15 @@ class StdoutWriter {
         });
     }
     write(obj) {
-        const payload = `${JSON.stringify(obj)}\n`;
+        const payload = Buffer.from(msgpackEncode(obj));
+        const prefix = Buffer.allocUnsafe(4);
+        prefix.writeUInt32BE(payload.byteLength, 0);
+        const frame = Buffer.concat([prefix, payload]);
         if (this.paused) {
-            this.enqueue(payload);
+            this.enqueue(frame);
             return;
         }
-        if (!process.stdout.write(payload)) {
+        if (!process.stdout.write(frame)) {
             this.paused = true;
         }
     }
@@ -248,17 +252,14 @@ async function handleRequest(request) {
             throw new Error(`Unknown method ${request.method}`);
     }
 }
-let residual = "";
-function processLine(line) {
-    if (!line.trim()) {
-        return;
-    }
+let stdinBuffer = Buffer.alloc(0);
+function processFrame(buffer) {
     let request;
     try {
-        request = JSON.parse(line);
+        request = msgpackDecode(buffer);
     }
     catch (error) {
-        writer.write({ id: -1, error: { message: `Invalid JSON: ${String(error)}` } });
+        writer.write({ id: -1, error: { message: `Invalid msgpack: ${String(error)}` } });
         return;
     }
     handleRequest(request)
@@ -274,15 +275,16 @@ function processLine(line) {
         writer.write(response);
     });
 }
-process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
-    residual += chunk;
-    let index = residual.indexOf("\n");
-    while (index !== -1) {
-        const line = residual.slice(0, index);
-        residual = residual.slice(index + 1);
-        processLine(line);
-        index = residual.indexOf("\n");
+    stdinBuffer = Buffer.concat([stdinBuffer, chunk]);
+    while (stdinBuffer.byteLength >= 4) {
+        const frameLength = stdinBuffer.readUInt32BE(0);
+        if (stdinBuffer.byteLength < frameLength + 4) {
+            break;
+        }
+        const frame = stdinBuffer.subarray(4, 4 + frameLength);
+        processFrame(frame);
+        stdinBuffer = stdinBuffer.subarray(4 + frameLength);
     }
 });
 process.stdin.on("end", () => {
