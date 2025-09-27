@@ -1,0 +1,23 @@
+{
+  "name": "nvim-acp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p bridge/tsconfig.json",
+    "dev": "tsc -w -p bridge/tsconfig.json",
+    "mock": "pnpm build && node bridge/dist/mock/src/mock-server.js",
+    "test:ts": "pnpm build && node --test bridge/dist/tests/ts/bridge.spec.js",
+    "test": "pnpm test:ts"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/node": "^20.19.17",
+    "@types/ws": "^8.5.12",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  }
+}

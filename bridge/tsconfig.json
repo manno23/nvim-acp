@@ -1,0 +1,9 @@
+{
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "outDir": "../bridge/dist",
+    "rootDir": ".."
+  },
+  "include": ["./src", "../tests/ts", "../mock/src"],
+  "exclude": ["../bridge/dist"]
+}
