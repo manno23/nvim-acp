@@ -11,6 +11,9 @@ importers:
       '@msgpack/msgpack':
         specifier: ^3.0.0
         version: 3.1.2
+      capnweb:
+        specifier: ^0.1.0
+        version: 0.1.0
       ws:
         specifier: ^8.18.3
         version: 8.18.3
@@ -133,6 +136,9 @@ packages:
 
   arg@4.1.3:
     resolution: {integrity: sha512-58S9QDqG0Xx27YwPSt9fJxivjYl432YCwfDMfZ+71RAqUrZef7LrKQZ3LHLOwCS4FLNBplP533Zx895SeOCHvA==}
+
+  capnweb@0.1.0:
+    resolution: {integrity: sha512-+pygKx1JFTZTRdd1hHgaBRg5BwULEDZq8ZoHXkYP2GXNV3lrjXLj5qzlGz+SgBCJjWUmNBtlh7JPWdr0wIbY8w==}
 
   create-require@1.1.1:
     resolution: {integrity: sha512-dcKFX3jn0MpIaXjisoRvexIJVEKzaq7z2rZKxf+MSr9TkdmHmsU4m2lcLojrj/FHl8mk5VxMmYA+ftRkP/3oKQ==}
@@ -260,6 +266,8 @@ snapshots:
   acorn@8.15.0: {}
 
   arg@4.1.3: {}
+
+  capnweb@0.1.0: {}
 
   create-require@1.1.1: {}
 

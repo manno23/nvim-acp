@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import process from "node:process";
 import WebSocket from "ws";
-import { encode as msgpackEncode, decode as msgpackDecode } from "@msgpack/msgpack";
+import { newWebSocketRpcSession, RpcTarget } from "./capnweb-shim.js";
 class StdoutWriter {
     queue = [];
     paused = false;
@@ -12,15 +13,12 @@ class StdoutWriter {
         });
     }
     write(obj) {
-        const payload = Buffer.from(msgpackEncode(obj));
-        const prefix = Buffer.allocUnsafe(4);
-        prefix.writeUInt32BE(payload.byteLength, 0);
-        const frame = Buffer.concat([prefix, payload]);
+        const payload = `${JSON.stringify(obj)}\n`;
         if (this.paused) {
-            this.enqueue(frame);
+            this.enqueue(payload);
             return;
         }
-        if (!process.stdout.write(frame)) {
+        if (!process.stdout.write(payload)) {
             this.paused = true;
         }
     }
@@ -43,19 +41,71 @@ class StdoutWriter {
         }
     }
 }
+function logInvariant(event, details) {
+    process.stderr.write(`[acp-bridge:${event}] ${JSON.stringify(details)}\n`);
+}
+class BridgeJobObserver extends RpcTarget {
+    jobId;
+    writer;
+    onResult;
+    constructor(jobId, writer, onResult) {
+        super();
+        this.jobId = jobId;
+        this.writer = writer;
+        this.onResult = onResult;
+    }
+    async event(event) {
+        logInvariant("job_event", { jobId: this.jobId, kind: event.kind, phase: event.progress?.phase });
+        const payload = {
+            jobId: this.jobId,
+            event,
+        };
+        this.writer.write({ method: "event", params: payload });
+    }
+    async result(result) {
+        logInvariant("job_result", { jobId: this.jobId, status: result.status });
+        const payload = {
+            jobId: this.jobId,
+            result,
+        };
+        this.writer.write({ method: "event", params: payload });
+        this.onResult(this.jobId);
+    }
+}
+class BridgeFactsObserver extends RpcTarget {
+    subscriptionId;
+    writer;
+    onClosed;
+    constructor(subscriptionId, writer, onClosed) {
+        super();
+        this.subscriptionId = subscriptionId;
+        this.writer = writer;
+        this.onClosed = onClosed;
+    }
+    async fact(record) {
+        logInvariant("fact", { subscriptionId: this.subscriptionId, scope: record.scope });
+        const payload = {
+            subscriptionId: this.subscriptionId,
+            fact: record,
+        };
+        this.writer.write({ method: "fact", params: payload });
+    }
+    async closed(reason) {
+        logInvariant("fact_closed", { subscriptionId: this.subscriptionId, reason });
+        this.onClosed(this.subscriptionId);
+    }
+}
 class AcpConnection {
     writer;
-    ws;
-    callId = 0;
-    pending = new Map();
-    jobByCall = new Map();
-    factsByCall = new Map();
-    shuttingDown = false;
+    socket;
+    stub;
+    jobs = new Map();
+    subscriptions = new Map();
     constructor(writer) {
         this.writer = writer;
     }
     async connect(config) {
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+        if (this.stub) {
             return;
         }
         const url = config.url ?? process.env.ACP_WS_URL;
@@ -67,146 +117,145 @@ class AcpConnection {
         if (token) {
             headers.Authorization = `Bearer ${token}`;
         }
-        await new Promise((resolve, reject) => {
-            const socket = new WebSocket(url, {
-                headers,
-            });
-            let timeoutHandle;
-            const timeout = config.connectTimeoutMs ?? 10_000;
-            if (timeout > 0) {
-                timeoutHandle = setTimeout(() => {
-                    socket.terminate();
-                    reject(new Error("Timed out connecting to ACP"));
-                }, timeout);
-            }
-            socket.once("open", () => {
-                if (timeoutHandle) {
-                    clearTimeout(timeoutHandle);
-                }
-                this.ws = socket;
-                this.setupSocket(socket);
-                resolve();
-            });
-            socket.once("error", (err) => {
-                if (timeoutHandle) {
-                    clearTimeout(timeoutHandle);
-                }
-                reject(err instanceof Error ? err : new Error(String(err)));
-            });
+        const socket = new WebSocket(url, { headers });
+        await this.awaitOpen(socket, config.connectTimeoutMs ?? 10_000);
+        this.socket = socket;
+        this.stub = newWebSocketRpcSession(socket);
+        this.stub.onRpcBroken((err) => {
+            logInvariant("rpc_broken", { message: err instanceof Error ? err.message : String(err) });
+            this.writer.write({ method: "disconnect", params: {} });
+            this.cleanupAll();
+            this.stub = undefined;
         });
+        logInvariant("connect", { url });
     }
-    submit(req) {
-        return this.sendCall("acp.Acp", "submit", req, (callId, payload) => {
-            const job = payload.job;
-            if (job?.id) {
-                this.jobByCall.set(callId, job.id);
-            }
+    submit(request) {
+        this.assertConnected();
+        const jobId = randomUUID();
+        const job = this.stub.submit(request);
+        const observer = new BridgeJobObserver(jobId, this.writer, (id) => this.finishJob(id));
+        this.jobs.set(jobId, { stub: job, observer });
+        logInvariant("job_minted", { jobId, action: request.action });
+        job
+            .watch(observer)
+            .catch((error) => {
+            logInvariant("job_watch_error", { jobId, message: error instanceof Error ? error.message : String(error) });
+            this.writer.write({
+                method: "event",
+                params: {
+                    jobId,
+                    result: { status: "failure", message: String(error) },
+                },
+            });
+            this.finishJob(jobId);
         });
+        return { job: { id: jobId } };
     }
-    cancel(jobId) {
-        return this.sendCall("acp.Job", "cancel", { jobId });
+    async cancel(jobId) {
+        this.assertConnected();
+        const handle = this.jobs.get(jobId);
+        if (!handle) {
+            throw new Error(`Unknown job ${jobId}`);
+        }
+        logInvariant("job_cancel", { jobId });
+        await handle.stub.cancel();
+        return { canceled: true };
     }
     subscribeFacts(meta, filters) {
-        return this.sendCall("acp.Acp", "subscribeFacts", { meta, filters }, (callId, payload) => {
-            const sub = payload.subscription;
-            if (sub?.id) {
-                this.factsByCall.set(callId, sub.id);
-            }
+        this.assertConnected();
+        const subscriptionId = randomUUID();
+        const stub = this.stub.subscribeFacts(meta, filters);
+        const observer = new BridgeFactsObserver(subscriptionId, this.writer, (id) => this.finishSubscription(id));
+        this.subscriptions.set(subscriptionId, { stub, observer });
+        logInvariant("facts_minted", { subscriptionId, scope: meta.scope });
+        stub
+            .observe(observer)
+            .catch((error) => {
+            logInvariant("facts_observe_error", {
+                subscriptionId,
+                message: error instanceof Error ? error.message : String(error),
+            });
+            this.finishSubscription(subscriptionId);
         });
+        return { subscription: { id: subscriptionId } };
     }
-    closeFacts(subscriptionId) {
-        return this.sendCall("acp.FactsSubscription", "close", { subscriptionId });
+    async closeFacts(subscriptionId) {
+        this.assertConnected();
+        const handle = this.subscriptions.get(subscriptionId);
+        if (!handle) {
+            throw new Error(`Unknown subscription ${subscriptionId}`);
+        }
+        logInvariant("facts_close", { subscriptionId });
+        await handle.stub.close();
+        this.finishSubscription(subscriptionId);
+        return { closed: true };
     }
     shutdown() {
-        this.shuttingDown = true;
-        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-            this.ws.close(1000, "shutdown");
+        this.cleanupAll();
+        if (this.socket && this.socket.readyState === WebSocket.OPEN) {
+            this.socket.close(1000, "shutdown");
         }
-        for (const [, pending] of this.pending) {
-            pending.reject(new Error("Bridge shutting down"));
+        if (this.stub && typeof this.stub[Symbol.dispose] === "function") {
+            this.stub[Symbol.dispose]();
         }
-        this.pending.clear();
+        this.stub = undefined;
     }
-    sendCall(interfaceId, method, payload, onReturn) {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-            return Promise.reject(new Error("Not connected"));
+    async awaitOpen(socket, timeout) {
+        if (socket.readyState === WebSocket.OPEN) {
+            return;
         }
-        const callId = `${++this.callId}`;
-        return new Promise((resolve, reject) => {
-            this.pending.set(callId, {
-                resolve: (value) => {
-                    if (onReturn) {
-                        onReturn(callId, value);
-                    }
-                    resolve(value);
-                },
-                reject,
-            });
-            const message = {
-                type: "call",
-                callId,
-                interfaceId,
-                method,
-                payload,
-            };
-            this.ws?.send(JSON.stringify(message), (err) => {
-                if (err) {
-                    this.pending.delete(callId);
-                    reject(err);
+        await new Promise((resolve, reject) => {
+            const timer = timeout > 0 ? setTimeout(() => {
+                socket.terminate();
+                reject(new Error("Timed out connecting to ACP"));
+            }, timeout) : undefined;
+            socket.once("open", () => {
+                if (timer) {
+                    clearTimeout(timer);
                 }
+                resolve();
+            });
+            socket.once("error", (error) => {
+                if (timer) {
+                    clearTimeout(timer);
+                }
+                reject(error instanceof Error ? error : new Error(String(error)));
             });
         });
     }
-    setupSocket(socket) {
-        socket.on("message", (data) => {
-            try {
-                const msg = JSON.parse(data.toString());
-                this.handleMessage(msg);
-            }
-            catch (error) {
-                process.stderr.write(`acp-bridge failed to parse message: ${String(error)}\n`);
-            }
-        });
-        socket.on("close", () => {
-            if (this.shuttingDown) {
-                return;
-            }
-            this.writer.write({ method: "disconnect", params: {} });
-        });
+    assertConnected() {
+        if (!this.stub) {
+            throw new Error("Not connected");
+        }
     }
-    handleMessage(message) {
-        const { type, callId } = message;
-        if (type === "return" && callId) {
-            const pending = this.pending.get(callId);
-            if (pending) {
-                this.pending.delete(callId);
-                pending.resolve(message.payload);
-            }
+    finishJob(jobId) {
+        const handle = this.jobs.get(jobId);
+        if (!handle) {
             return;
         }
-        if (type === "exception" && callId) {
-            const pending = this.pending.get(callId);
-            if (pending) {
-                this.pending.delete(callId);
-                pending.reject(new Error(message.error?.message ?? "ACP exception"));
-            }
+        this.jobs.delete(jobId);
+        logInvariant("job_finalized", { jobId });
+        if (typeof handle.stub[Symbol.dispose] === "function") {
+            handle.stub[Symbol.dispose]();
+        }
+    }
+    finishSubscription(subscriptionId) {
+        const handle = this.subscriptions.get(subscriptionId);
+        if (!handle) {
             return;
         }
-        if (type === "event" && callId) {
-            const payload = message.event;
-            const jobId = this.jobByCall.get(callId);
-            const factsId = this.factsByCall.get(callId);
-            if (payload?.kind === "jobEvent" && jobId) {
-                const event = { jobId, event: payload.event };
-                this.writer.write({ method: "event", params: event });
-            }
-            else if (payload?.kind === "jobResult" && jobId) {
-                const result = { jobId, result: payload.result };
-                this.writer.write({ method: "event", params: result });
-            }
-            else if (payload?.kind === "fact" && factsId) {
-                this.writer.write({ method: "fact", params: { subscriptionId: factsId, fact: payload.fact } });
-            }
+        this.subscriptions.delete(subscriptionId);
+        logInvariant("facts_finalized", { subscriptionId });
+        if (typeof handle.stub[Symbol.dispose] === "function") {
+            handle.stub[Symbol.dispose]();
+        }
+    }
+    cleanupAll() {
+        for (const jobId of this.jobs.keys()) {
+            this.finishJob(jobId);
+        }
+        for (const subId of this.subscriptions.keys()) {
+            this.finishSubscription(subId);
         }
     }
 }
@@ -252,14 +301,17 @@ async function handleRequest(request) {
             throw new Error(`Unknown method ${request.method}`);
     }
 }
-let stdinBuffer = Buffer.alloc(0);
-function processFrame(buffer) {
+let residual = "";
+function processLine(line) {
+    if (!line.trim()) {
+        return;
+    }
     let request;
     try {
-        request = msgpackDecode(buffer);
+        request = JSON.parse(line);
     }
     catch (error) {
-        writer.write({ id: -1, error: { message: `Invalid msgpack: ${String(error)}` } });
+        writer.write({ id: -1, error: { message: `Invalid JSON: ${String(error)}` } });
         return;
     }
     handleRequest(request)
@@ -275,16 +327,15 @@ function processFrame(buffer) {
         writer.write(response);
     });
 }
+process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
-    stdinBuffer = Buffer.concat([stdinBuffer, chunk]);
-    while (stdinBuffer.byteLength >= 4) {
-        const frameLength = stdinBuffer.readUInt32BE(0);
-        if (stdinBuffer.byteLength < frameLength + 4) {
-            break;
-        }
-        const frame = stdinBuffer.subarray(4, 4 + frameLength);
-        processFrame(frame);
-        stdinBuffer = stdinBuffer.subarray(4 + frameLength);
+    residual += chunk;
+    let index = residual.indexOf("\n");
+    while (index !== -1) {
+        const line = residual.slice(0, index);
+        residual = residual.slice(index + 1);
+        processLine(line);
+        index = residual.indexOf("\n");
     }
 });
 process.stdin.on("end", () => {

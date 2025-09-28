@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0",
+    "capnweb": "^0.1.0",
     "ws": "^8.18.3"
   },
   "devDependencies": {

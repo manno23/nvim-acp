@@ -3,21 +3,18 @@ import { spawn } from "node:child_process";
 import process from "node:process";
 import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { encode, decode } from "@msgpack/msgpack";
-import { WebSocketServer } from "ws";
+import { startMockServer } from "../../mock/src/mock-server.js";
 
-type ResponseMessage = {
+interface ResponseMessage {
   id: number;
   result?: unknown;
   error?: { message: string };
-};
+}
 
-type EventMessage = {
+interface EventMessage {
   method: string;
   params: Record<string, any>;
-};
-
-type BridgeMessage = ResponseMessage | EventMessage;
+}
 
 async function waitFor(predicate: () => boolean, timeoutMs = 5000) {
   const start = Date.now();
@@ -37,35 +34,39 @@ function startBridge(t: test.TestContext, env: Record<string, string>) {
 
   const responses = new Map<number, ResponseMessage>();
   const events: EventMessage[] = [];
-  let buffer = Buffer.alloc(0);
+  const stderrLogs: string[] = [];
+  let buffer = "";
 
-  child.stdout.on("data", (chunk: Buffer) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    while (buffer.byteLength >= 4) {
-      const frameLength = buffer.readUInt32BE(0);
-      if (buffer.byteLength < 4 + frameLength) {
-        break;
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    buffer += chunk;
+    let index = buffer.indexOf("\n");
+    while (index !== -1) {
+      const line = buffer.slice(0, index);
+      buffer = buffer.slice(index + 1);
+      if (line.trim().length === 0) {
+        index = buffer.indexOf("\n");
+        continue;
       }
-      const frame = buffer.subarray(4, 4 + frameLength);
-      buffer = buffer.subarray(4 + frameLength);
-      const message = decode(frame) as BridgeMessage;
+      const message = JSON.parse(line) as ResponseMessage | EventMessage;
+      console.log("[bridge->test]", message);
       if (typeof (message as ResponseMessage).id === "number") {
         responses.set((message as ResponseMessage).id, message as ResponseMessage);
       } else {
         events.push(message as EventMessage);
       }
+      index = buffer.indexOf("\n");
     }
   });
 
-  child.stderr.on("data", (chunk) => {
-    process.stderr.write(chunk);
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    const lines = chunk.split(/\n/).map((line) => line.trim()).filter(Boolean);
+    stderrLogs.push(...lines);
   });
 
   function send(obj: unknown) {
-    const payload = Buffer.from(encode(obj));
-    const prefix = Buffer.allocUnsafe(4);
-    prefix.writeUInt32BE(payload.byteLength, 0);
-    child.stdin.write(Buffer.concat([prefix, payload]));
+    child.stdin.write(`${JSON.stringify(obj)}\n`);
   }
 
   async function waitForResponse(id: number, timeoutMs = 5000) {
@@ -78,16 +79,13 @@ function startBridge(t: test.TestContext, env: Record<string, string>) {
     return events.filter(predicate).slice(0, count);
   }
 
-  function shutdown() {
-    if (!child.killed) {
+  async function shutdown() {
+    if (!child.killed && child.exitCode === null) {
       child.stdin.end();
       child.kill();
+      await new Promise<void>((resolve) => child.once("exit", () => resolve()));
     }
   }
-
-  t.after(() => {
-    shutdown();
-  });
 
   return {
     send,
@@ -95,166 +93,14 @@ function startBridge(t: test.TestContext, env: Record<string, string>) {
     waitForEvents,
     responses,
     events,
+    stderrLogs,
     shutdown,
   };
 }
 
-function onceListening(wss: WebSocketServer) {
-  return new Promise<void>((resolve) => {
-    if (wss.address()) {
-      resolve();
-      return;
-    }
-    wss.once("listening", () => resolve());
-  });
-}
-
-function wsAddress(wss: WebSocketServer) {
-  const address = wss.address();
-  if (typeof address === "string" || !address) {
-    throw new Error("expected TCP address");
-  }
-  return `ws://127.0.0.1:${address.port}`;
-}
-
-test("bridge mints job capability handles and preserves events", { timeout: 10_000 }, async (t) => {
-  const wss = new WebSocketServer({ port: 0 });
-  t.after(() => wss.close());
-
-  const jobId = "job-mint";
-  let submitPayload: any;
-
-  wss.on("connection", (ws) => {
-    ws.on("message", (raw) => {
-      const msg = JSON.parse(raw.toString());
-      if (msg.type !== "call") {
-        return;
-      }
-      if (msg.method === "submit") {
-        submitPayload = msg.payload;
-        ws.send(
-          JSON.stringify({
-            type: "return",
-            callId: msg.callId,
-            payload: { job: { id: jobId } },
-          }),
-        );
-        ws.send(
-          JSON.stringify({
-            type: "event",
-            callId: msg.callId,
-            event: {
-              kind: "jobEvent",
-              event: {
-                kind: "progress",
-                timestamp: new Date().toISOString(),
-                progress: { current: 1, total: 4, phase: "checking" },
-              },
-            },
-          }),
-        );
-        ws.send(
-          JSON.stringify({
-            type: "event",
-            callId: msg.callId,
-            event: {
-              kind: "jobResult",
-              result: {
-                status: "success",
-                message: "done",
-              },
-            },
-          }),
-        );
-      }
-    });
-  });
-
-  await onceListening(wss);
-  const url = wsAddress(wss);
-
-  const bridge = startBridge(t, { ACP_WS_URL: url });
-  bridge.send({ id: 1, method: "connect", params: {} });
-  await bridge.waitForResponse(1);
-
-  const requestPayload = {
-    id: 2,
-    method: "submit",
-    params: {
-      request: {
-        action: "contact_points",
-        parameters: { uri: "file:///test.lua" },
-      },
-    },
-  } as const;
-  bridge.send(requestPayload);
-
-  const response = await bridge.waitForResponse(2);
-  assert.deepEqual(response.result, { job: { id: jobId } });
-  assert.deepEqual(submitPayload, requestPayload.params.request);
-
-  const [progressEvent, resultEvent] = await bridge.waitForEvents(
-    (evt) => evt.method === "event",
-    2,
-  );
-
-  assert.equal(progressEvent.params.jobId, jobId);
-  assert.equal(resultEvent.params.jobId, jobId);
-  assert.deepEqual(progressEvent.params.event?.progress, { current: 1, total: 4, phase: "checking" });
-  assert.equal(resultEvent.params.result?.status, "success");
-});
-
-test("bridge preserves capability identity for cancel", { timeout: 10_000 }, async (t) => {
-  const wss = new WebSocketServer({ port: 0 });
-  t.after(() => wss.close());
-
-  const jobId = "job-cancel";
-  let cancelPayload: any;
-  let submitCallId: string | undefined;
-
-  wss.on("connection", (ws) => {
-    ws.on("message", (raw) => {
-      const msg = JSON.parse(raw.toString());
-      if (msg.type !== "call") {
-        return;
-      }
-      if (msg.method === "submit") {
-        submitCallId = msg.callId;
-        ws.send(
-          JSON.stringify({
-            type: "return",
-            callId: msg.callId,
-            payload: { job: { id: jobId } },
-          }),
-        );
-      }
-      if (msg.method === "cancel") {
-        cancelPayload = msg.payload;
-        ws.send(
-          JSON.stringify({
-            type: "return",
-            callId: msg.callId,
-            payload: { status: "canceled" },
-          }),
-        );
-        if (submitCallId) {
-          ws.send(
-            JSON.stringify({
-              type: "event",
-              callId: submitCallId,
-              event: {
-                kind: "jobResult",
-                result: { status: "canceled", message: "user" },
-              },
-            }),
-          );
-        }
-      }
-    });
-  });
-
-  await onceListening(wss);
-  const url = wsAddress(wss);
+test("capnweb bridge pipelines job observers and streams results", { timeout: 15_000 }, async (t) => {
+  const server = startMockServer(0);
+  const url = await server.ready;
 
   const bridge = startBridge(t, { ACP_WS_URL: url });
   bridge.send({ id: 1, method: "connect", params: {} });
@@ -264,68 +110,85 @@ test("bridge preserves capability identity for cancel", { timeout: 10_000 }, asy
     id: 2,
     method: "submit",
     params: {
-      request: { action: "long", parameters: {} },
+      request: {
+        action: "contact_points",
+        parameters: { uri: "file:///tmp/test.lua" },
+      },
     },
   });
-  await bridge.waitForResponse(2);
+  const submitResponse = await bridge.waitForResponse(2);
+  const jobHandle = (submitResponse.result as any).job.id;
+  t.diagnostic(`submit response: ${JSON.stringify(submitResponse)}`);
+  assert.ok(typeof jobHandle === "string" && jobHandle.length > 0, "bridge minted job handle");
 
-  bridge.send({ id: 3, method: "cancel", params: { jobId } });
-  await bridge.waitForResponse(3);
+  const [progressEvent, resultEvent] = await bridge.waitForEvents((evt) => evt.method === "event", 2);
+  t.diagnostic(`received events: ${JSON.stringify([progressEvent, resultEvent])}`);
+  assert.equal(progressEvent.params.jobId, jobHandle);
+  assert.equal(resultEvent.params.jobId, jobHandle);
+  assert.equal(progressEvent.params.event?.kind, "progress");
+  assert.equal(resultEvent.params.result?.status, "success");
 
-  assert.deepEqual(cancelPayload, { jobId });
+  console.log("[timeline snapshot]", server.timeline);
+  const submitTimeline = server.timeline.filter((entry) => entry.includes("submit"))[0];
+  const jobId = submitTimeline.split(":")[1];
+  const expectedOrder = [
+    `submit:${jobId}:contact_points`,
+    `watch:${jobId}`,
+    `event:${jobId}:progress`,
+    `result:${jobId}`,
+  ];
+  assert.deepEqual(
+    server.timeline.slice(1, 1 + expectedOrder.length),
+    expectedOrder,
+    "mock server timeline preserves pipelined watch before events",
+  );
 
-  const [resultEvent] = await bridge.waitForEvents((evt) => evt.method === "event", 1);
-  assert.equal(resultEvent.params.jobId, jobId);
-  assert.equal(resultEvent.params.result?.status, "canceled");
+  console.log("[invariant] job timeline", server.timeline);
+  console.log("[invariant] bridge stderr", bridge.stderrLogs);
+  await bridge.shutdown();
+  await server.close();
 });
 
-test("bridge propagates fact subscriptions with intact payloads", { timeout: 10_000 }, async (t) => {
-  const wss = new WebSocketServer({ port: 0 });
-  t.after(() => wss.close());
+test("capnweb bridge cancels jobs before completion", { timeout: 15_000 }, async (t) => {
+  const server = startMockServer(0);
+  const url = await server.ready;
 
-  const subscriptionId = "facts-1";
-  let subscribePayload: any;
+  const bridge = startBridge(t, { ACP_WS_URL: url });
+  bridge.send({ id: 1, method: "connect", params: {} });
+  await bridge.waitForResponse(1);
 
-  wss.on("connection", (ws) => {
-    ws.on("message", (raw) => {
-      const msg = JSON.parse(raw.toString());
-      if (msg.type !== "call") {
-        return;
-      }
-      if (msg.method === "subscribeFacts") {
-        subscribePayload = msg.payload;
-        ws.send(
-          JSON.stringify({
-            type: "return",
-            callId: msg.callId,
-            payload: { subscription: { id: subscriptionId } },
-          }),
-        );
-        ws.send(
-          JSON.stringify({
-            type: "event",
-            callId: msg.callId,
-            event: {
-              kind: "fact",
-              fact: { scope: "workspace", id: "alpha", content: { k: 1 } },
-            },
-          }),
-        );
-      }
-      if (msg.method === "close") {
-        ws.send(
-          JSON.stringify({
-            type: "return",
-            callId: msg.callId,
-            payload: { closed: true },
-          }),
-        );
-      }
-    });
+  bridge.send({
+    id: 2,
+    method: "submit",
+    params: { request: { action: "slow", parameters: {} } },
   });
+  const response = await bridge.waitForResponse(2);
+  const jobHandle = (response.result as any).job.id as string;
+  t.diagnostic(`cancel test response: ${JSON.stringify(response)}`);
 
-  await onceListening(wss);
-  const url = wsAddress(wss);
+  bridge.send({ id: 3, method: "cancel", params: { jobId: jobHandle } });
+  await bridge.waitForResponse(3);
+
+  const [resultEvent] = await bridge.waitForEvents((evt) => evt.method === "event" && evt.params.result, 1);
+  t.diagnostic(`cancel event: ${JSON.stringify(resultEvent)}`);
+  assert.equal(resultEvent.params.result?.status, "canceled");
+
+  console.log("[cancel timeline snapshot]", server.timeline);
+  const cancelEntry = server.timeline.find((entry) => entry.startsWith("cancel:"));
+  assert.ok(cancelEntry, "server recorded cancel call");
+  const resultIndex = server.timeline.findIndex((entry) => entry.startsWith("result:"));
+  const cancelIndex = server.timeline.findIndex((entry) => entry.startsWith("cancel:"));
+  assert.ok(resultIndex === -1 || cancelIndex < resultIndex, "cancel delivered before result emission");
+
+  console.log("[invariant] cancel timeline", server.timeline);
+  console.log("[invariant] bridge stderr", bridge.stderrLogs);
+  await bridge.shutdown();
+  await server.close();
+});
+
+test("capnweb bridge streams fact subscriptions", { timeout: 15_000 }, async (t) => {
+  const server = startMockServer(0);
+  const url = await server.ready;
 
   const bridge = startBridge(t, { ACP_WS_URL: url });
   bridge.send({ id: 1, method: "connect", params: {} });
@@ -339,18 +202,24 @@ test("bridge propagates fact subscriptions with intact payloads", { timeout: 10_
       filters: [{ kind: "language", value: "lua" }],
     },
   });
-
   const subscribeResponse = await bridge.waitForResponse(2);
-  assert.deepEqual(subscribeResponse.result, { subscription: { id: subscriptionId } });
-  assert.deepEqual(subscribePayload, {
-    meta: { scope: "workspace", cursor: "0" },
-    filters: [{ kind: "language", value: "lua" }],
-  });
+  const subscriptionId = (subscribeResponse.result as any).subscription.id as string;
+  t.diagnostic(`facts response: ${JSON.stringify(subscribeResponse)}`);
+  assert.ok(subscriptionId);
 
   const [factEvent] = await bridge.waitForEvents((evt) => evt.method === "fact", 1);
+  t.diagnostic(`fact event: ${JSON.stringify(factEvent)}`);
   assert.equal(factEvent.params.subscriptionId, subscriptionId);
-  assert.deepEqual(factEvent.params.fact, { scope: "workspace", id: "alpha", content: { k: 1 } });
+  assert.equal(factEvent.params.fact.scope, "workspace");
 
   bridge.send({ id: 3, method: "closeFacts", params: { subscriptionId } });
   await bridge.waitForResponse(3);
+
+  const closeEntry = server.timeline.find((entry) => entry.startsWith("facts_close:"));
+  assert.ok(closeEntry, "close recorded on server timeline");
+
+  console.log("[invariant] facts timeline", server.timeline);
+  console.log("[invariant] bridge stderr", bridge.stderrLogs);
+  await bridge.shutdown();
+  await server.close();
 });

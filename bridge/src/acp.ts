@@ -1,3 +1,5 @@
+import type { RpcTarget } from "capnweb";
+
 export interface Artifact {
   id: string;
   uri: string;
@@ -51,45 +53,35 @@ export interface FactFilter {
   value?: string;
 }
 
-export type CapnpRequest =
-  | {
-      type: "call";
-      interfaceId: string;
-      method: string;
-      payload: unknown;
-    }
-  | {
-      type: "cancel";
-      callId: string;
-    };
-
-export interface CapnpResponse {
-  type: "return" | "exception" | "event";
-  callId?: string;
-  payload?: unknown;
-  event?: unknown;
-  error?: { message: string };
-}
-
-export interface JobHandle {
+export interface FactRecord {
   id: string;
+  scope: string;
+  payload: Record<string, unknown>;
 }
 
-export interface FactsSubscriptionHandle {
-  id: string;
+export interface JobObserver extends RpcTarget {
+  event(event: ActionEvent): void;
+  result(result: ActionResult): void;
 }
 
-export interface SubmitResponse {
-  job: JobHandle;
+export interface FactsObserver extends RpcTarget {
+  fact(record: FactRecord): void;
+  closed(reason?: string): void;
 }
 
-export interface CancelParams {
-  jobId: string;
+export interface Job extends RpcTarget {
+  watch(observer: JobObserver): void;
+  cancel(): void;
 }
 
-export interface SubscribeFactsParams {
-  meta: FactMeta;
-  filters: FactFilter[];
+export interface FactsSubscription extends RpcTarget {
+  observe(observer: FactsObserver): void;
+  close(): void;
+}
+
+export interface Acp extends RpcTarget {
+  submit(request: ActionRequest): Job;
+  subscribeFacts(meta: FactMeta, filters: FactFilter[]): FactsSubscription;
 }
 
 export interface BridgeEvent {
@@ -115,17 +107,17 @@ export interface BridgeConfig {
   connectTimeoutMs?: number;
 }
 
-export type JobEvent = {
+export type JobEventPayload = {
   jobId: string;
   event: ActionEvent;
 };
 
-export type JobResultEvent = {
+export type JobResultPayload = {
   jobId: string;
   result: ActionResult;
 };
 
-export type FactNotification = {
+export type FactPayload = {
   subscriptionId: string;
-  fact: unknown;
+  fact: FactRecord;
 };
