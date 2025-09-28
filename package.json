@@ -12,7 +12,8 @@
   },
   "dependencies": {
     "@msgpack/msgpack": "^3.0.0",
-    "ws": "^8.18.3"
+    "ws": "^8.18.3",
+    "capnweb": "^0.1.0"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.4",
